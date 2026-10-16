@@ -1,0 +1,38 @@
+server {
+  listen 80;
+  server_name chess.connermccarthy.com;
+
+  return 301 https://$host$request_uri;
+}
+
+server {
+  listen 443 ssl;
+  server_name chess.connermccarthy.com;
+
+  root /home/ubuntu/chess-webapp;
+  index index.html;
+
+  ssl_certificate /etc/letsencrypt/live/chess.connermccarthy.com/fullchain.pem;
+  ssl_certificate_key /etc/letsencrypt/live/chess.connermccarthy.com/privkey.pem;
+  include /etc/letsencrypt/options-ssl-nginx.conf;
+  ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+  add_header Strict-Transport-Security "max-age=31536000" always;
+  add_header Cross-Origin-Opener-Policy "same-origin" always;
+  add_header Cross-Origin-Embedder-Policy "require-corp" always;
+  add_header Cross-Origin-Resource-Policy "same-origin" always;
+
+  # Never serve dotfiles such as .git/ (except ACME challenges).
+  location ~ /\.(?!well-known) {
+    return 404;
+  }
+
+  location / {
+    try_files $uri $uri/ /index.html;
+  }
+
+  location ~* \.wasm$ {
+    default_type application/wasm;
+    try_files $uri =404;
+  }
+}

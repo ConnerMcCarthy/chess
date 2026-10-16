@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#111310">
+    <meta name="description" content="Local King of the Hill chess analysis with Fairy-Stockfish.">
+    <title>Hill Lab | King of the Hill Analysis</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <header class="app-header">
+      <a class="brand" href="/" aria-label="Hill Lab home">
+        <span class="brand-mark" aria-hidden="true">K</span>
+        <span>
+          <strong>Hill Lab</strong>
+          <small>King of the Hill analysis</small>
+        </span>
+      </a>
+      <div class="header-actions">
+        <span class="engine-status" id="engine-status" data-state="loading">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span id="engine-status-text">Loading engine</span>
+        </span>
+        <button class="button secondary compact saved-open" id="saved-open" type="button">Saved</button>
+        <button class="button secondary compact" id="import-open" type="button" title="Import a PGN">
+          <span aria-hidden="true">+</span> Import PGN
+        </button>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <aside class="library-panel" aria-label="Saved games">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">This browser</p>
+            <h2>Saved games</h2>
+          </div>
+          <div class="panel-heading-actions">
+            <span class="count-badge" id="saved-count">0</span>
+            <button class="icon-button library-close" id="saved-close" type="button" aria-label="Close saved games">×</button>
+          </div>
+        </div>
+        <div class="library-list" id="saved-games"></div>
+        <div class="empty-library" id="empty-library">
+          <span class="empty-icon" aria-hidden="true">♜</span>
+          <p>No saved games yet.</p>
+          <small>Imported games can be stored in this browser.</small>
+        </div>
+        <button class="button secondary full-width" id="new-game" type="button">New analysis</button>
+      </aside>
+      <button class="library-backdrop" id="library-backdrop" type="button" aria-label="Close saved games"></button>
+
+      <section class="board-section" aria-label="Chess board">
+        <div class="game-heading">
+          <div>
+            <p class="eyebrow" id="game-event">KING OF THE HILL</p>
+            <h1 id="game-title">Untitled analysis</h1>
+            <p class="player-line" id="player-line">White <span>vs</span> Black</p>
+          </div>
+          <button class="icon-button" id="flip-board" type="button" title="Flip board" aria-label="Flip board">↻</button>
+        </div>
+
+        <div class="board-eval-layout">
+          <div class="evaluation-bar" id="evaluation-bar" aria-label="Position evaluation">
+            <div class="eval-black" id="eval-black"></div>
+            <div class="eval-white" id="eval-white"></div>
+            <span class="eval-label" id="eval-label">0.0</span>
+          </div>
+          <div class="board-wrap">
+            <div class="board" id="board" role="grid" aria-label="King of the Hill chess board"></div>
+          </div>
+        </div>
+
+        <div class="board-toolbar" aria-label="Move navigation">
+          <button class="icon-button" id="first-move" type="button" title="First position" aria-label="First position">|‹</button>
+          <button class="icon-button" id="previous-move" type="button" title="Previous move" aria-label="Previous move">‹</button>
+          <div class="position-status">
+            <span class="position-label" id="position-label">Starting position</span>
+            <button class="text-button return-preview" id="return-preview" type="button" hidden>Return to game</button>
+          </div>
+          <button class="icon-button" id="next-move" type="button" title="Next move" aria-label="Next move">›</button>
+          <button class="icon-button" id="last-move" type="button" title="Last position" aria-label="Last position">›|</button>
+        </div>
+
+        <div class="hill-rule">
+          <span class="hill-swatch" aria-hidden="true"></span>
+          <p><strong>Reach the hill to win.</strong> A king wins immediately on d4, e4, d5, or e5. Checkmate still wins normally.</p>
+        </div>
+      </section>
+
+      <aside class="analysis-panel" aria-label="Engine analysis">
+        <div class="analysis-tabs" role="tablist" aria-label="Analysis views">
+          <button class="tab active" id="analysis-tab" type="button" role="tab" aria-selected="true">Analysis</button>
+          <button class="tab" id="moves-tab" type="button" role="tab" aria-selected="false">Moves</button>
+        </div>
+
+        <div class="tab-panel" id="analysis-view" role="tabpanel">
+          <div class="engine-summary">
+            <div>
+              <p class="eyebrow">Fairy-Stockfish</p>
+              <strong class="score" id="score">0.0</strong>
+              <span id="score-owner">Equal</span>
+            </div>
+            <div class="engine-controls">
+              <div class="depth-control">
+                <label for="depth">Depth <output id="depth-value">14</output></label>
+                <input id="depth" type="range" min="8" max="24" value="14" step="1">
+              </div>
+              <div class="arrow-control">
+                <label class="toggle-label" for="show-arrows">
+                  <input id="show-arrows" type="checkbox" checked>
+                  <span>Board arrows</span>
+                </label>
+                <div class="line-selector" id="line-selector" role="group" aria-label="Engine lines">
+                  <button class="line-choice active" type="button" data-line-count="1">1</button>
+                  <button class="line-choice" type="button" data-line-count="2">2</button>
+                  <button class="line-choice" type="button" data-line-count="3">3</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="principal-variation">
+            <p class="eyebrow">Best line</p>
+            <ol id="best-line">
+              <li class="muted">Analyze the position to see the engine line.</li>
+            </ol>
+          </div>
+
+          <div class="analysis-actions">
+            <button class="button primary" id="analyze-position" type="button">Analyze position</button>
+            <button class="button secondary" id="analyze-game" type="button">Analyze full game</button>
+          </div>
+          <div class="progress-wrap" id="progress-wrap" hidden>
+            <div class="progress-track"><span id="progress-bar"></span></div>
+            <span id="progress-text">Analyzing 0 / 0</span>
+            <button class="text-button" id="cancel-analysis" type="button">Cancel</button>
+          </div>
+
+          <div class="position-facts">
+            <div><span>Turn</span><strong id="turn-value">White</strong></div>
+            <div><span>Distance to hill</span><strong id="hill-distance">3 moves</strong></div>
+            <div><span>Position</span><strong id="position-number">Start</strong></div>
+          </div>
+
+          <div class="engine-note" id="engine-note">
+            Evaluations use King of the Hill rules. Positive scores favor White; negative scores favor Black.
+          </div>
+        </div>
+
+        <div class="tab-panel" id="moves-view" role="tabpanel" hidden>
+          <div class="move-list" id="move-list"></div>
+          <div class="empty-moves" id="empty-moves">Import a PGN to review its moves.</div>
+        </div>
+
+        <div class="save-strip">
+          <span id="save-state">Not saved</span>
+          <button class="button secondary compact" id="save-game" type="button">Save game</button>
+        </div>
+      </aside>
+    </main>
+
+    <dialog class="import-dialog" id="import-dialog">
+      <form method="dialog" class="dialog-shell" id="import-form">
+        <div class="dialog-heading">
+          <div>
+            <p class="eyebrow">Load a game</p>
+            <h2>Import PGN</h2>
+          </div>
+          <button class="icon-button" id="import-close" type="button" aria-label="Close dialog">×</button>
+        </div>
+        <label for="pgn-input">Paste standard or Chess.com Variants PGN</label>
+        <textarea id="pgn-input" rows="14" spellcheck="false" placeholder="[Event &quot;King of the Hill&quot;]&#10;[White &quot;Player one&quot;]&#10;[Black &quot;Player two&quot;]&#10;&#10;1. e4 e5 2. Ke2 Nf6 ..."></textarea>
+        <p class="form-error" id="pgn-error" role="alert"></p>
+        <div class="dialog-actions">
+          <button class="text-button" id="load-example" type="button">Use example</button>
+          <span class="dialog-spacer"></span>
+          <button class="button secondary" id="cancel-import" type="button">Cancel</button>
+          <button class="button primary" id="load-pgn" type="submit">Load game</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+    <script src="engine/stockfish.js"></script>
+    <script type="module" src="app.js"></script>
+  </body>
+</html>
