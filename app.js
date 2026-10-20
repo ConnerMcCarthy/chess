@@ -1,6 +1,11 @@
 import { Chess, DEFAULT_POSITION } from './vendor/chess.js';
 
 const STORAGE_KEY = 'hill-lab-games-v1';
+const EVAL_CACHE_KEY = 'hill-lab-evals-v1';
+const EVAL_CACHE_LIMIT = 3000;
+// Full-game analysis spends a fixed node budget per position instead of
+// chasing a depth, so tactical middlegames cannot stall the whole run.
+const GAME_NODES = 400000;
 const ENGINE_NOTE = 'Evaluations use King of the Hill rules. Positive scores favor White; negative scores favor Black.';
 const HILL_SQUARES = new Set(['d4', 'e4', 'd5', 'e5']);
 const FILES = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
@@ -40,6 +45,7 @@ const state = {
   selectedSquare: null,
   legalMoves: [],
   showArrows: localStorage.getItem('hill-lab-show-arrows') !== 'false',
+  liveAnalysis: localStorage.getItem('hill-lab-live-analysis') !== 'false',
   lineCount: Math.max(1, Math.min(3, Number(localStorage.getItem('hill-lab-line-count')) || 1)),
   preview: null,
 };
@@ -50,11 +56,12 @@ class KothEngine {
     this.engine = null;
     this.waiters = [];
     this.initializing = null;
-    this.cache = new Map();
+    this.searching = null;
+    // Runs on the visitor's machine; leave one core free for the page.
     const logicalCores = navigator.hardwareConcurrency || 2;
     const deviceMemory = navigator.deviceMemory || 4;
-    this.threads = Math.min(4, Math.max(1, logicalCores - 1));
-    this.hash = deviceMemory >= 8 ? 128 : deviceMemory >= 4 ? 96 : 64;
+    this.threads = Math.min(8, Math.max(1, logicalCores - 1));
+    this.hash = deviceMemory >= 8 ? 256 : deviceMemory >= 4 ? 128 : 64;
     this.readyText = `KOTH engine ready · ${this.threads}T · ${this.hash} MB`;
   }
 
@@ -128,12 +135,27 @@ class KothEngine {
     });
   }
 
-  async analyze(fen, depth, multiPv = 1, onUpdate = null) {
-    const cacheKey = `${multiPv}:${fen}`;
-    const cached = this.cache.get(cacheKey);
-    if (cached?.depth >= depth) return { ...cached, cached: true };
+  // request: { depth, nodes, multiPv, onUpdate, isCurrent }. Searches run one
+  // at a time; a queued search whose isCurrent() turns false is skipped.
+  async analyze(fen, request) {
+    const { depth, nodes, multiPv = 1, onUpdate = null, isCurrent = () => true } = request;
+    const cached = evalCache.get(evalKey(fen));
+    if (analysisSatisfies(cached, request)) return { ...cached, cached: true };
 
     await this.init();
+    const previous = this.searching;
+    let release;
+    this.searching = new Promise((resolve) => { release = resolve; });
+    try {
+      await previous;
+      if (!isCurrent()) return null;
+      return await this.search(fen, depth, nodes, multiPv, onUpdate);
+    } finally {
+      release();
+    }
+  }
+
+  async search(fen, depth, nodes, multiPv, onUpdate) {
     const latestLines = new Map();
     const infoListener = {
       observe: (line) => {
@@ -149,7 +171,7 @@ class KothEngine {
     try {
       this.send(`setoption name MultiPV value ${multiPv}`);
       this.send('position fen ' + fen);
-      this.send('go depth ' + depth);
+      this.send(`go depth ${depth}${nodes ? ` nodes ${nodes}` : ''}`);
       const bestMoveLine = await this.waitFor(
         (line) => line.startsWith('bestmove '),
         600000,
@@ -160,8 +182,7 @@ class KothEngine {
         ...buildAnalysisResult(latestLines, multiPv),
         bestMove,
       };
-      this.cache.set(cacheKey, result);
-      if (this.cache.size > 256) this.cache.delete(this.cache.keys().next().value);
+      rememberEval(fen, result);
       return result;
     } finally {
       this.waiters = this.waiters.filter((candidate) => candidate !== infoListener);
@@ -173,12 +194,14 @@ class KothEngine {
   }
 }
 
+const evalCache = readEvalCache();
 const engine = new KothEngine(setEngineStatus);
 
 function parseInfoLine(line, fen) {
   if (!line.startsWith('info ') || !line.includes(' score ')) return null;
   const depthMatch = line.match(/\bdepth (\d+)/);
   const multiPvMatch = line.match(/\bmultipv (\d+)/);
+  const nodesMatch = line.match(/\bnodes (\d+)/);
   const scoreMatch = line.match(/\bscore (cp|mate) (-?\d+)/);
   if (!scoreMatch) return null;
 
@@ -191,6 +214,7 @@ function parseInfoLine(line, fen) {
   return {
     multiPv: Number(multiPvMatch?.[1] || 1),
     depth: Number(depthMatch?.[1] || 0),
+    nodes: Number(nodesMatch?.[1] || 0),
     score: isMate ? Math.sign(rawValue || 1) * 100 * perspective : (rawValue / 100) * perspective,
     mate: isMate ? rawValue * perspective : null,
     pv: pvIndex >= 0 ? line.slice(pvIndex + 4).trim().split(/\s+/) : [],
@@ -202,9 +226,74 @@ function buildAnalysisResult(latestLines, requestedLines) {
   const primary = lines[0] || { depth: 0, score: 0, mate: null, pv: [] };
   return {
     ...primary,
+    nodes: Math.max(0, ...lines.map((line) => line.nodes || 0)),
     lines,
     multiPv: requestedLines,
   };
+}
+
+function analysisSatisfies(analysis, request) {
+  if (!analysis || (analysis.multiPv || 1) < (request.multiPv || 1)) return false;
+  if (request.depth && analysis.depth >= request.depth) return true;
+  return Boolean(request.nodes && analysis.nodes >= request.nodes);
+}
+
+function isBetterAnalysis(candidate, existing) {
+  if (!existing) return true;
+  if (candidate.depth !== existing.depth) return candidate.depth > existing.depth;
+  if ((candidate.multiPv || 1) !== (existing.multiPv || 1)) {
+    return (candidate.multiPv || 1) > (existing.multiPv || 1);
+  }
+  return (candidate.nodes || 0) > (existing.nodes || 0);
+}
+
+// Evaluations persist per position (ignoring move counters) so revisiting a
+// game or reaching a known position is instant.
+function evalKey(fen) {
+  return fen.split(' ').slice(0, 4).join(' ');
+}
+
+function readEvalCache() {
+  try {
+    const entries = JSON.parse(localStorage.getItem(EVAL_CACHE_KEY) || '[]');
+    return new Map(Array.isArray(entries) ? entries : []);
+  } catch {
+    return new Map();
+  }
+}
+
+let evalCacheWriteTimer;
+function rememberEval(fen, result) {
+  if (!result?.depth || result.depth < 8) return;
+  const key = evalKey(fen);
+  if (!isBetterAnalysis(result, evalCache.get(key))) return;
+  const trimLine = (line) => ({ ...line, pv: line.pv.slice(0, 16) });
+  evalCache.delete(key);
+  evalCache.set(key, { ...trimLine(result), lines: result.lines.map(trimLine), cached: undefined });
+  while (evalCache.size > EVAL_CACHE_LIMIT) evalCache.delete(evalCache.keys().next().value);
+  clearTimeout(evalCacheWriteTimer);
+  evalCacheWriteTimer = setTimeout(writeEvalCache, 500);
+}
+
+function writeEvalCache() {
+  try {
+    localStorage.setItem(EVAL_CACHE_KEY, JSON.stringify([...evalCache]));
+  } catch {
+    // Storage full: drop the oldest half and try once more.
+    [...evalCache.keys()].slice(0, Math.ceil(evalCache.size / 2)).forEach((key) => evalCache.delete(key));
+    try {
+      localStorage.setItem(EVAL_CACHE_KEY, JSON.stringify([...evalCache]));
+    } catch {
+      // Leave the in-memory cache in place.
+    }
+  }
+}
+
+function fillAnalysesFromCache() {
+  state.positions.forEach((position, index) => {
+    const cached = evalCache.get(evalKey(position.fen));
+    if (cached && isBetterAnalysis(cached, state.analyses[index])) state.analyses[index] = cached;
+  });
 }
 
 function parsePgn(pgn) {
@@ -347,7 +436,9 @@ function loadGame(game, options = {}) {
   state.currentIndex = options.atStart ? 0 : state.positions.length - 1;
   state.savedId = game.id || null;
   state.analyses = game.analyses || {};
+  fillAnalysesFromCache();
   renderAll();
+  scheduleLiveAnalysis();
 }
 
 function resetWorkspace() {
@@ -456,12 +547,46 @@ function findKing(chess, color) {
 }
 
 function renderGameHeading() {
-  const white = state.headers.White || 'White';
-  const black = state.headers.Black || 'Black';
-  const event = state.headers.Event || 'King of the Hill';
-  els['game-event'].textContent = (state.headers.Variant || 'King of the Hill').toUpperCase();
-  els['game-title'].textContent = event;
-  els['player-line'].innerHTML = `${escapeHtml(white)} <span>vs</span> ${escapeHtml(black)}`;
+  const headers = state.headers;
+  const source = gameSource(headers);
+  const variant = headers.Variant || 'King of the Hill';
+  els['game-event'].textContent = (source ? `${source} · ${variant}` : variant).toUpperCase();
+  els['game-title'].textContent = gameTitle(headers);
+  const player = (name, elo) => escapeHtml(name) + (elo && elo !== '?' ? ` <small>${escapeHtml(elo)}</small>` : '');
+  els['player-line'].innerHTML = `${player(headers.White || 'White', headers.WhiteElo)} <span>vs</span> ${player(headers.Black || 'Black', headers.BlackElo)}`;
+}
+
+function gameSource(headers = {}) {
+  if (/lichess\.org/i.test(headers.Site || '') || headers.Annotator === 'lichess.org') return 'Lichess';
+  if (/chess\.com/i.test(headers.Site || '') || headers.StartFen4 || headers.SourceVariant || headers.GameNr) {
+    return 'Chess.com';
+  }
+  return null;
+}
+
+// Sites write machine-style Event tags ("rated variant:kingOfTheHill game",
+// "Chess.com game 123"); replace those with "Rated King of the Hill · 15+10".
+function gameTitle(headers = {}) {
+  const event = (headers.Event || '').trim();
+  const lichessEvent = event.match(/^(rated|casual)\b.*\bgame$/i);
+  const generic = !event || event === '?' || /^Chess\.com (game \d+|variants game)$/i.test(event);
+  if (!lichessEvent && !generic) return event;
+  const mode = lichessEvent ? lichessEvent[1][0].toUpperCase() + lichessEvent[1].slice(1).toLowerCase() + ' ' : '';
+  const control = formatTimeControl(headers.TimeControl);
+  return `${mode}${headers.Variant || 'King of the Hill'}${control ? ' · ' + control : ''}`;
+}
+
+function formatTimeControl(value = '') {
+  const match = value.match(/^(\d+)(?:\+(\d+))?$/);
+  if (!match) return '';
+  const minutes = Number(match[1]) / 60;
+  const base = Number.isInteger(minutes) ? String(minutes) : minutes.toFixed(1).replace(/\.0$/, '');
+  return match[2] !== undefined ? `${base}+${match[2]}` : `${base} min`;
+}
+
+function gameDate(headers = {}) {
+  const match = (headers.UTCDate || headers.Date || '').match(/^(\d{4})\.(\d{2})\.(\d{2})$/);
+  return match ? `${match[1]}-${match[2]}-${match[3]}` : null;
 }
 
 function renderMoveList() {
@@ -743,11 +868,14 @@ function updateNavigation() {
 function goToPosition(index) {
   clearBoardSelection();
   state.preview = null;
-  state.currentIndex = Math.max(0, Math.min(state.positions.length - 1, index));
+  const nextIndex = Math.max(0, Math.min(state.positions.length - 1, index));
+  const moved = nextIndex !== state.currentIndex;
+  state.currentIndex = nextIndex;
   renderBoard();
   renderMoveList();
   renderAnalysis();
   updateNavigation();
+  if (moved) scheduleLiveAnalysis();
 }
 
 function previewBestLine(lineIndex, ply) {
@@ -779,57 +907,95 @@ function returnToGamePosition() {
   setAnalysisControls(false);
 }
 
-async function analyzeCurrentPosition() {
+// Live analysis follows the displayed game position, like Lichess: it starts
+// on arrival, streams deeper results, and stops when the position changes.
+let liveToken = 0;
+let liveTimer = null;
+function scheduleLiveAnalysis() {
+  const token = ++liveToken;
+  clearTimeout(liveTimer);
   if (state.analyzing) return;
-  if (hillWinner(new Chess(state.positions[state.currentIndex].fen))) {
-    showToast('This game has already ended on the hill');
+  engine.stop();
+  if (!state.liveAnalysis || !state.engineReady) {
+    if (state.engineReady) setEngineStatus('ready', engine.readyText);
     return;
   }
+  liveTimer = setTimeout(() => runLiveAnalysis(token), 120);
+}
+
+async function runLiveAnalysis(token) {
   const index = state.currentIndex;
-  const requestedDepth = Number(els.depth.value);
-  if (analysisMeetsRequest(state.analyses[index], requestedDepth, state.lineCount)) {
-    renderAnalysis();
-    showToast(`Reused depth ${state.analyses[index].depth} analysis`);
+  const fen = state.positions[index].fen;
+  const chess = new Chess(fen);
+  if (hillWinner(chess) || chess.isGameOver()) {
+    setEngineStatus('ready', engine.readyText);
     return;
   }
-  state.analyzing = true;
-  setAnalysisControls(true);
+  const request = { depth: Number(els.depth.value), multiPv: state.lineCount };
+  if (analysisSatisfies(state.analyses[index], request)) {
+    setEngineStatus('ready', engine.readyText);
+    return;
+  }
+  const isCurrent = () => token === liveToken;
   setEngineStatus('working', 'Analyzing position');
   try {
-    const result = await engine.analyze(
-      state.positions[index].fen,
-      requestedDepth,
-      state.lineCount,
-      (partial) => updateLiveAnalysis(index, partial),
-    );
-    state.analyses[index] = result;
-    renderAnalysis();
-    renderMoveList();
-    markUnsaved();
-    setEngineStatus('ready', engine.readyText);
-    els['engine-note'].textContent = ENGINE_NOTE;
+    const result = await engine.analyze(fen, {
+      ...request,
+      isCurrent,
+      onUpdate: (partial) => {
+        if (isCurrent()) updateLiveAnalysis(index, fen, partial);
+      },
+    });
+    if (result && state.positions[index]?.fen === fen && isBetterAnalysis(result, state.analyses[index])) {
+      state.analyses[index] = result;
+      if (state.currentIndex === index) renderAnalysis();
+      renderMoveList();
+    }
+    if (isCurrent()) {
+      setEngineStatus('ready', engine.readyText);
+      els['engine-note'].textContent = ENGINE_NOTE;
+    }
   } catch (error) {
-    handleEngineError(error);
-  } finally {
-    state.analyzing = false;
-    setAnalysisControls(false);
+    if (isCurrent()) handleEngineError(error);
   }
+}
+
+function toggleLiveAnalysis() {
+  state.liveAnalysis = !state.liveAnalysis;
+  localStorage.setItem('hill-lab-live-analysis', String(state.liveAnalysis));
+  renderLiveToggle();
+  scheduleLiveAnalysis();
+}
+
+function renderLiveToggle() {
+  const button = els['analyze-position'];
+  button.textContent = state.liveAnalysis ? 'Live analysis: On' : 'Live analysis: Off';
+  button.setAttribute('aria-pressed', String(state.liveAnalysis));
+  button.classList.toggle('primary', state.liveAnalysis);
+  button.classList.toggle('secondary', !state.liveAnalysis);
 }
 
 async function analyzeFullGame() {
   if (state.analyzing) return;
+  liveToken += 1;
+  clearTimeout(liveTimer);
+  engine.stop();
   state.analyzing = true;
   state.cancelRequested = false;
   setAnalysisControls(true);
   els['progress-wrap'].hidden = false;
   setEngineStatus('working', 'Analyzing full game');
   const total = state.positions.length;
+  // One line per position is all the move list needs.
+  const request = { depth: Number(els.depth.value), nodes: GAME_NODES, multiPv: 1 };
 
   try {
-    for (let index = 0; index < total; index += 1) {
+    // Walk backwards so the hash table built on later positions speeds up
+    // the earlier ones.
+    for (let index = total - 1, completed = 0; index >= 0; index -= 1, completed += 1) {
       if (state.cancelRequested) break;
-      updateProgress(index, total);
-      if (analysisMeetsRequest(state.analyses[index], Number(els.depth.value), state.lineCount)) continue;
+      updateProgress(completed, total);
+      if (analysisSatisfies(state.analyses[index], request)) continue;
       const winner = hillWinner(new Chess(state.positions[index].fen));
       if (winner) {
         state.analyses[index] = {
@@ -843,12 +1009,8 @@ async function analyzeFullGame() {
         };
         continue;
       }
-      const result = await engine.analyze(
-        state.positions[index].fen,
-        Number(els.depth.value),
-        state.lineCount,
-      );
-      state.analyses[index] = result;
+      const result = await engine.analyze(state.positions[index].fen, request);
+      if (isBetterAnalysis(result, state.analyses[index])) state.analyses[index] = result;
       if (state.currentIndex === index) renderAnalysis();
       renderMoveList();
     }
@@ -866,16 +1028,13 @@ async function analyzeFullGame() {
     state.cancelRequested = false;
     setAnalysisControls(false);
     window.setTimeout(() => { els['progress-wrap'].hidden = true; }, 700);
+    scheduleLiveAnalysis();
   }
 }
 
-function analysisMeetsRequest(analysis, depth, lineCount) {
-  if (!analysis || analysis.depth < depth) return false;
-  return (analysis.multiPv || 1) >= lineCount;
-}
-
 let liveAnalysisFrame = null;
-function updateLiveAnalysis(index, partial) {
+function updateLiveAnalysis(index, fen, partial) {
+  if (state.positions[index]?.fen !== fen || !isBetterAnalysis(partial, state.analyses[index])) return;
   state.analyses[index] = partial;
   if (partial.depth) setEngineStatus('working', `Analyzing · depth ${partial.depth}`);
   if (state.currentIndex !== index || liveAnalysisFrame !== null) return;
@@ -894,7 +1053,7 @@ function stopAnalysis() {
 
 function setAnalysisControls(disabled) {
   const terminal = hillWinner(new Chess(state.positions[state.currentIndex].fen));
-  els['analyze-position'].disabled = disabled || Boolean(terminal) || Boolean(state.preview);
+  els['analyze-position'].disabled = disabled;
   els['analyze-game'].disabled = disabled || Boolean(state.preview);
   els.depth.disabled = disabled;
   els['show-arrows'].disabled = disabled;
@@ -979,14 +1138,29 @@ function renderLibrary() {
     button.type = 'button';
     button.className = 'library-game' + (state.savedId === game.id ? ' active' : '');
     button.dataset.gameId = game.id;
+    const headers = game.headers || {};
+    const source = gameSource(headers);
     const title = document.createElement('strong');
-    title.textContent = game.headers?.Event || 'Untitled game';
-    const players = document.createElement('span');
-    players.textContent = `${game.headers?.White || 'White'} vs ${game.headers?.Black || 'Black'}`;
+    title.textContent = `${headers.White || 'White'} vs ${headers.Black || 'Black'}`;
+    const details = document.createElement('span');
+    details.textContent = [gameTitle(headers), headers.Result && headers.Result !== '*' ? headers.Result : null]
+      .filter(Boolean)
+      .join(' · ');
+    const meta = document.createElement('div');
+    meta.className = 'library-meta';
+    if (source) {
+      const badge = document.createElement('em');
+      badge.className = 'source-badge';
+      badge.dataset.source = source.toLowerCase().replace(/\W/g, '');
+      badge.textContent = source;
+      meta.append(badge);
+    }
+    const playedOn = gameDate(headers);
     const time = document.createElement('time');
-    time.dateTime = game.savedAt;
-    time.textContent = formatDate(game.savedAt);
-    button.append(title, players, time);
+    time.dateTime = playedOn || game.savedAt;
+    time.textContent = playedOn ? `Played ${formatDate(`${playedOn}T12:00`)}` : `Saved ${formatDate(game.savedAt)}`;
+    meta.append(time);
+    button.append(title, details, meta);
 
     const remove = document.createElement('button');
     remove.type = 'button';
@@ -1167,9 +1341,9 @@ function attemptBoardMove(from, to) {
   updateNavigation();
   markUnsaved();
 
-  if (!hillWinner(chess) && !chess.isGameOver()) {
-    window.setTimeout(analyzeCurrentPosition, 80);
-  }
+  fillAnalysesFromCache();
+  renderAnalysis();
+  scheduleLiveAnalysis();
   return true;
 }
 
@@ -1261,13 +1435,14 @@ els['saved-games'].addEventListener('click', (event) => {
 });
 els['analysis-tab'].addEventListener('click', () => switchTab('analysis'));
 els['moves-tab'].addEventListener('click', () => switchTab('moves'));
-els['analyze-position'].addEventListener('click', analyzeCurrentPosition);
+els['analyze-position'].addEventListener('click', toggleLiveAnalysis);
 els['analyze-game'].addEventListener('click', analyzeFullGame);
 els['cancel-analysis'].addEventListener('click', stopAnalysis);
 els['save-game'].addEventListener('click', saveCurrentGame);
 els.depth.addEventListener('input', () => {
   els['depth-value'].textContent = els.depth.value;
 });
+els.depth.addEventListener('change', scheduleLiveAnalysis);
 els['show-arrows'].addEventListener('change', () => {
   state.showArrows = els['show-arrows'].checked;
   localStorage.setItem('hill-lab-show-arrows', String(state.showArrows));
@@ -1280,10 +1455,7 @@ els['line-selector'].addEventListener('click', (event) => {
   localStorage.setItem('hill-lab-line-count', String(state.lineCount));
   renderArrowControls();
   renderBoardArrows();
-  const analysis = state.analyses[state.currentIndex];
-  if (analysis && (analysis.multiPv || 1) < state.lineCount) {
-    showToast(`Analyze again to calculate ${state.lineCount} lines`);
-  }
+  scheduleLiveAnalysis();
 });
 document.addEventListener('keydown', (event) => {
   if (els['import-dialog'].open || event.target.matches('input, textarea')) return;
@@ -1292,9 +1464,14 @@ document.addEventListener('keydown', (event) => {
 });
 
 renderArrowControls();
+renderLiveToggle();
+fillAnalysesFromCache();
 renderAll();
 engine.init()
-  .then(() => { state.engineReady = true; })
+  .then(() => {
+    state.engineReady = true;
+    scheduleLiveAnalysis();
+  })
   .catch((error) => {
     console.error(error);
     els['engine-note'].textContent = error.message;

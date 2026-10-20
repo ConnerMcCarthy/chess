@@ -6,7 +6,7 @@
     <meta name="theme-color" content="#111310">
     <meta name="description" content="Local King of the Hill chess analysis with Fairy-Stockfish.">
     <title>Hill Lab | King of the Hill Analysis</title>
-    <link rel="stylesheet" href="styles.css?v=8935a75">
+    <link rel="stylesheet" href="styles.css?v=20261020-2">
   </head>
   <body>
     <header class="app-header">
@@ -104,8 +104,8 @@
             </div>
             <div class="engine-controls">
               <div class="depth-control">
-                <label for="depth">Depth <output id="depth-value">14</output></label>
-                <input id="depth" type="range" min="8" max="24" value="14" step="1">
+                <label for="depth">Depth <output id="depth-value">18</output></label>
+                <input id="depth" type="range" min="8" max="24" value="18" step="1">
               </div>
               <div class="arrow-control">
                 <label class="toggle-label" for="show-arrows">
@@ -129,7 +129,7 @@
           </div>
 
           <div class="analysis-actions">
-            <button class="button primary" id="analyze-position" type="button">Analyze position</button>
+            <button class="button primary" id="analyze-position" type="button" aria-pressed="true">Live analysis: On</button>
             <button class="button secondary" id="analyze-game" type="button">Analyze full game</button>
           </div>
           <div class="progress-wrap" id="progress-wrap" hidden>
@@ -185,6 +185,6 @@
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
     <script src="engine/stockfish.js"></script>
-    <script type="module" src="app.js?v=8935a75"></script>
+    <script type="module" src="app.js?v=20261020-2"></script>
   </body>
 </html>
