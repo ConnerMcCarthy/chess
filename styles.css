@@ -565,6 +565,7 @@ h2 {
 .board::after {
   border: max(1.5px, 0.18vw) solid rgb(223 183 72 / 55%);
   border-radius: 2px;
+  box-sizing: border-box;
   content: "";
   height: 25%;
   left: 37.5%;
