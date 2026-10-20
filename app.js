@@ -214,7 +214,7 @@ function parsePgn(pgn) {
   }
 
   const parsed = new Chess();
-  parsed.loadPgn(pgn, { strict: false });
+  parsed.loadPgn(stripMoveTextComments(pgn), { strict: false });
   const headers = parsed.getHeaders();
   const verboseMoves = parsed.history({ verbose: true });
   const startFen = headers.FEN || DEFAULT_POSITION;
@@ -240,6 +240,13 @@ function parsePgn(pgn) {
   }
 
   return { headers, positions, pgn };
+}
+
+// chess.js rejects consecutive brace comments, which Lichess exports emit
+// (clock comment followed by opening name or termination text).
+function stripMoveTextComments(pgn) {
+  const headerBlock = pgn.match(/^(?:\s*\[[^\r\n]*\][ \t]*(?:\r?\n|$))*/)[0];
+  return headerBlock + pgn.slice(headerBlock.length).replace(/\{[^}]*\}/g, ' ');
 }
 
 function parseTagHeaders(pgn) {
