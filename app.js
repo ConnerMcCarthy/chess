@@ -1461,6 +1461,10 @@ document.addEventListener('keydown', (event) => {
   if (els['import-dialog'].open || event.target.matches('input, textarea')) return;
   if (event.key === 'ArrowLeft') goToPosition(state.currentIndex - 1);
   if (event.key === 'ArrowRight') goToPosition(state.currentIndex + 1);
+  if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
+    event.preventDefault();
+    goToPosition(event.key === 'ArrowUp' ? 0 : state.positions.length - 1);
+  }
 });
 
 renderArrowControls();
